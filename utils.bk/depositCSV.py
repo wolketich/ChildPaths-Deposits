@@ -1,6 +1,5 @@
 import csv
 import time
-import os
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -10,6 +9,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.keys import Keys
 from difflib import SequenceMatcher
 from dotenv import load_dotenv
+import os
 
 # === CONFIG ===
 CSV_FILE = "transactions.csv"
@@ -18,9 +18,9 @@ LOG_FILE = "transaction_debug.log"
 
 # === UTILS ===
 def fuzzy_match(name, options):
-    scores = [(SequenceMatcher(None, name.lower(), o[0].lower()).ratio(), *o) for o in options]
+    scores = [(SequenceMatcher(None, name.lower(), o[0].lower()).ratio(), *o) for o in options if o[0].strip()]
     scores.sort(reverse=True, key=lambda x: x[0])
-    return scores[:5]
+    return scores
 
 def log_debug(msg):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -68,6 +68,18 @@ def extract_billpayers(driver):
     log_debug(f"📋 Extracted {len(billpayers)} billpayers.")
     return billpayers
 
+def prompt_fuzzy_choice(name, matches):
+    print(f"⚠️ No strong match for '{name}'. Select the best match or type 's' to skip:")
+    for i, (score, match_name, _) in enumerate(matches[:5]):
+        print(f"{i}: {match_name} (score: {int(score*100)}%)")
+    choice = input("Pick option number (or 's' to skip): ").strip()
+    if choice == 's':
+        return None
+    try:
+        return matches[int(choice)][1]
+    except:
+        return None
+
 def create_account(driver, wait, owner_name, branch_value):
     driver.get("https://app.childpaths.ie/user-finance-account/create")
     Select(driver.find_element(By.NAME, "branch")).select_by_value(branch_value)
@@ -79,14 +91,17 @@ def create_account(driver, wait, owner_name, branch_value):
             switch_wrapper.click()
     except: pass
     time.sleep(1)
+
     driver.find_element(By.CSS_SELECTOR, ".select2-selection--multiple").click()
     time.sleep(1)
     driver.switch_to.active_element.send_keys(owner_name)
     time.sleep(1.5)
     driver.switch_to.active_element.send_keys(Keys.ENTER)
     time.sleep(1)
+
     driver.find_element(By.CSS_SELECTOR, 'input[type="submit"][value="Create"]').click()
     time.sleep(2)
+
     errors = driver.find_elements(By.CSS_SELECTOR, ".alert-danger li, .alert-warning li")
     if errors:
         for e in errors:
@@ -124,8 +139,8 @@ def make_transaction(driver, wait, account_id, tx_type, amount, note, date):
 
 def main():
     load_dotenv()
-    email = os.getenv("CHILD_EMAIL")
-    password = os.getenv("CHILD_PASSWORD")
+    email = os.getenv("EMAIL")
+    password = os.getenv("PASSWORD")
     driver = load_driver()
     wait = WebDriverWait(driver, 10)
     report = []
@@ -138,58 +153,67 @@ def main():
         billpayers = extract_billpayers(driver)
         accounts = {}
 
-        matches = {}
-        with open(CSV_FILE, newline='', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
-            reader.fieldnames = [h.strip() for h in reader.fieldnames]
-            for row in reader:
-                row = {k.strip(): v.strip() for k, v in row.items()}
-                name = row.get('Bill Payer', '')
-                matched = fuzzy_match(name, billpayers)
-                if matched and matched[0][0] >= 0.95:
-                    matches[name] = matched[0][1]
-                else:
-                    print(f"❌ No perfect match for: {name}")
-                    for i, (score, label, _) in enumerate(matched):
-                        print(f"{i}: {label} ({int(score*100)}%)")
-                    idx = int(input("Pick best match #: "))
-                    matches[name] = matched[idx][1]
+        matches_by_name = {}
 
         with open(CSV_FILE, newline='', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             reader.fieldnames = [h.strip() for h in reader.fieldnames]
-            for row in reader:
-                row = {k.strip(): v.strip() for k, v in row.items()}
-                name = row.get('Bill Payer', '')
-                date = row.get('Date', '')
-                note = row.get('Note', '')
-                returned = row.get('Is Returned', '').lower() == 'yes'
-                amount_str = row.get('Amount', '0')
-                amount = float(amount_str) if amount_str else 0.0
-                tx_amount = 0.01 if amount == 0 else amount
-                matched_name = matches.get(name)
+            data = [dict((k.strip(), v.strip()) for k, v in row.items()) for row in reader]
 
-                if matched_name not in accounts:
-                    if not create_account(driver, wait, matched_name, branch_value):
-                        report.append([matched_name, "Account", amount, "FAILED", "Account creation failed"])
-                        continue
-                    account_id = get_account_id(driver)
-                    accounts[matched_name] = account_id
+        for row in data:
+            name = row.get('Bill Payer', '')
+            if name in matches_by_name:
+                continue
+            matches = fuzzy_match(name, billpayers)
+            if not matches:
+                log_debug(f"❌ Skipped: {name} (no billpayers found)")
+                matches_by_name[name] = None
+                continue
+            if matches[0][0] >= 0.95:
+                matches_by_name[name] = matches[0][1]
+            else:
+                selected = prompt_fuzzy_choice(name, matches)
+                if selected:
+                    matches_by_name[name] = selected
                 else:
-                    account_id = accounts[matched_name]
+                    log_debug(f"❌ Skipped: {name} (manual skip)")
+                    matches_by_name[name] = None
 
-                status = "OK"
-                if not make_transaction(driver, wait, account_id, "deposit", tx_amount, note, date):
-                    status = "FAILED"
-                    report.append([matched_name, "Deposit", tx_amount, status, "Error during deposit"])
+        for row in data:
+            name = row.get('Bill Payer', '')
+            if not matches_by_name.get(name):
+                report.append([name, "N/A", row.get('Amount', '0'), "FAILED", "Skipped"])
+                continue
+
+            matched_name = matches_by_name[name]
+            date = row.get('Date', '')
+            note = row.get('Note', '')
+            returned = row.get('Is Returned', '').lower() == 'yes'
+            amount_str = row.get('Amount', '0')
+            amount = float(amount_str) if amount_str else 0.0
+            tx_amount = 0.01 if amount == 0 else amount
+
+            if matched_name not in accounts:
+                if not create_account(driver, wait, matched_name, branch_value):
+                    report.append([matched_name, "Account", amount, "FAILED", "Account creation failed"])
                     continue
-                report.append([matched_name, "Deposit", tx_amount, "OK", ""])
+                account_id = get_account_id(driver)
+                accounts[matched_name] = account_id
+            else:
+                account_id = accounts[matched_name]
 
-                if returned or amount == 0:
-                    if not make_transaction(driver, wait, account_id, "withdrawal", tx_amount, note, date):
-                        report.append([matched_name, "Withdrawal", tx_amount, "FAILED", "Error during withdrawal"])
-                    else:
-                        report.append([matched_name, "Withdrawal", tx_amount, "OK", ""])
+            status = "OK"
+            if not make_transaction(driver, wait, account_id, "deposit", tx_amount, note, date):
+                status = "FAILED"
+                report.append([matched_name, "Deposit", tx_amount, status, "Error during deposit"])
+                continue
+            report.append([matched_name, "Deposit", tx_amount, "OK", ""])
+
+            if returned or amount == 0:
+                if not make_transaction(driver, wait, account_id, "withdrawal", tx_amount, note, date):
+                    report.append([matched_name, "Withdrawal", tx_amount, "FAILED", "Error during withdrawal"])
+                else:
+                    report.append([matched_name, "Withdrawal", tx_amount, "OK", ""])
 
         with open(REPORT_FILE, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
