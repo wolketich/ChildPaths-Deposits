@@ -1,0 +1,17 @@
+Bill Payer,Type,Amount,Status,Notes
+Emma Moore,Deposit,208.0,OK,
+Emma Moore,Withdrawal,208.0,OK,
+Fiona O Brien,Deposit,960.0,OK,
+Fiona O Brien,Deposit,0.01,OK,
+Fiona O Brien,Withdrawal,0.01,OK,
+Rosemary Anne Wynne,Deposit,570.0,OK,
+Rosemary Anne Wynne,Deposit,300.0,OK,
+Rosemary Anne Wynne,Deposit,50.0,OK,
+Leszek Wasko and Ewelina Wasko,N/A,0.0,FAILED,Billpayer not matched
+Alana and Eugene Davis,N/A,460.0,FAILED,Billpayer not matched
+Liza Reilly,Deposit,500.0,OK,
+Liza Reilly,Deposit,460.0,OK,
+Celeste Venter,N/A,500.0,FAILED,Billpayer not matched
+Michael Jones,Deposit,416.0,OK,
+Michael Jones,Deposit,0.01,OK,
+Michael Jones,Withdrawal,0.01,OK,

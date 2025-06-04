@@ -1,5 +1,7 @@
 import csv
 import time
+import os
+from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
@@ -7,29 +9,41 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.keys import Keys
 from difflib import SequenceMatcher
+from dotenv import load_dotenv
 
 # === CONFIG ===
 CSV_FILE = "transactions.csv"
 REPORT_FILE = "transaction_report.csv"
+LOG_FILE = "transaction_debug.log"
+
+load_dotenv()
 
 # === UTILS ===
 def fuzzy_match(name, options):
     scores = [(SequenceMatcher(None, name.lower(), o[0].lower()).ratio(), *o) for o in options]
     scores.sort(reverse=True, key=lambda x: x[0])
-    return scores[0] if scores else (0, None, None)
+    return scores
+
+def log_debug(msg):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {msg}\n")
+    print(msg)
 
 def load_driver():
     options = Options()
     options.add_argument("--window-size=1920,1080")
     return webdriver.Chrome(options=options)
 
-def login(driver, wait, email, password):
+def login(driver, wait):
+    email = os.getenv("CHILD_EMAIL")
+    password = os.getenv("CHILD_PASSWORD")
     driver.get("https://app.childpaths.ie/auth/login")
     wait.until(EC.presence_of_element_located((By.ID, "email"))).send_keys(email)
     driver.find_element(By.ID, "password").send_keys(password)
     driver.find_element(By.CSS_SELECTOR, "#signin-form button").click()
     wait.until(EC.url_contains("/dashboard"))
-    print("✅ Logged in")
+    log_debug("✅ Logged in")
 
 def select_branch(driver, wait):
     driver.get("https://app.childpaths.ie/user-finance-account/create")
@@ -40,9 +54,9 @@ def select_branch(driver, wait):
         print(f"{i}: {b.text.strip()} [{b.get_attribute('value')}]")
     index = int(input("Branch number: "))
     selected = branches[index]
-    Select(driver.find_element(By.NAME, "branch")).select_by_value(selected.get_attribute("value"))
-    print(f"✅ Branch selected: {selected.text.strip()}")
-    time.sleep(1)
+    branch_val = selected.get_attribute("value")
+    log_debug(f"✅ Branch selected: {selected.text.strip()}")
+    return branch_val
 
 def extract_billpayers(driver):
     driver.find_element(By.CSS_SELECTOR, ".select2-selection--multiple").click()
@@ -54,9 +68,13 @@ def extract_billpayers(driver):
         element_id = option.get_attribute("id")
         if name and element_id:
             billpayers.append((name, element_id))
+    log_debug(f"📋 Extracted {len(billpayers)} billpayers.")
     return billpayers
 
-def create_account(driver, wait, owner_name):
+def create_account(driver, wait, owner_name, branch_val):
+    driver.get("https://app.childpaths.ie/user-finance-account/create")
+    wait.until(EC.presence_of_element_located((By.NAME, "branch")))
+    Select(driver.find_element(By.NAME, "branch")).select_by_value(branch_val)
     driver.find_element(By.ID, "display_name").send_keys("Deposit Account")
     Select(driver.find_element(By.NAME, "currency")).select_by_value("EUR")
     try:
@@ -76,12 +94,12 @@ def create_account(driver, wait, owner_name):
     driver.find_element(By.CSS_SELECTOR, 'input[type="submit"][value="Create"]').click()
     time.sleep(2)
 
-    # Check if errors occurred
     errors = driver.find_elements(By.CSS_SELECTOR, ".alert-danger li, .alert-warning li")
     if errors:
         for e in errors:
-            print("❌ Form error:", e.text)
+            log_debug("❌ Form error: " + e.text)
         return False
+    log_debug(f"✅ Account created for {owner_name}")
     return True
 
 def get_account_id(driver):
@@ -105,69 +123,96 @@ def make_transaction(driver, wait, account_id, tx_type, amount, note, date):
             driver.find_element(By.NAME, "received_at").send_keys(date)
         driver.find_element(By.CSS_SELECTOR, 'input[type="submit"][value="Add"]').click()
         time.sleep(1.5)
+        log_debug(f"✅ {tx_type.capitalize()} successful for €{amount}")
         return True
     except Exception as e:
+        log_debug(f"❌ {tx_type.capitalize()} failed for €{amount}: {str(e)}")
         return False
 
 def main():
-    email = input("Email: ")
-    password = input("Password: ")
     driver = load_driver()
     wait = WebDriverWait(driver, 10)
     report = []
+    summary = {}
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        f.write("--- TRANSACTION DEBUG LOG ---\n")
+
     try:
-        login(driver, wait, email, password)
-        select_branch(driver, wait)
+        login(driver, wait)
+        branch_val = select_branch(driver, wait)
+        driver.get("https://app.childpaths.ie/user-finance-account/create")
+        Select(driver.find_element(By.NAME, "branch")).select_by_value(branch_val)
         billpayers = extract_billpayers(driver)
         accounts = {}
 
         with open(CSV_FILE, newline='', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             reader.fieldnames = [h.strip() for h in reader.fieldnames]
-            for row in reader:
-                row = {k.strip(): v.strip() for k, v in row.items()}
-                name = row.get('Bill Payer', '')
-                date = row.get('Date', '')
-                note = row.get('Note', '')
-                returned = row.get('Is Returned', '').lower() == 'yes'
-                amount_str = row.get('Amount', '0')
-                amount = float(amount_str) if amount_str else 0.0
-                tx_amount = 0.01 if amount == 0 else amount
+            transactions = list(reader)
 
-                score, matched_name, _ = fuzzy_match(name, billpayers)
-                if score < 0.6:
-                    print(f"❌ Skipped: {name} (no good match)")
-                    report.append([name, "N/A", amount, "FAILED", "Billpayer not matched"])
+        resolved = []
+        for row in transactions:
+            row = {k.strip(): v.strip() for k, v in row.items()}
+            name = row.get('Bill Payer', '')
+            amount_str = row.get('Amount', '0')
+            amount = float(amount_str) if amount_str else 0.0
+            tx_amount = 0.01 if amount == 0 else amount
+
+            matches = fuzzy_match(name, billpayers)
+            if matches[0][0] >= 0.95:
+                resolved.append((row, matches[0][1]))
+            else:
+                print(f"\nNo strong match for '{name}', pick one:")
+                for i, (_, opt, _) in enumerate(matches[:5]):
+                    print(f"{i}: {opt}")
+                index = int(input("Choice: "))
+                resolved.append((row, matches[index][1]))
+
+        for row, matched_name in resolved:
+            name = row.get('Bill Payer', '')
+            date = row.get('Date', '')
+            note = row.get('Note', '')
+            returned = row.get('Is Returned', '').lower() == 'yes'
+            amount_str = row.get('Amount', '0')
+            amount = float(amount_str) if amount_str else 0.0
+            tx_amount = 0.01 if amount == 0 else amount
+
+            if matched_name not in accounts:
+                if not create_account(driver, wait, matched_name, branch_val):
+                    report.append([matched_name, "Account", amount, "FAILED", "Account creation failed"])
                     continue
+                account_id = get_account_id(driver)
+                accounts[matched_name] = account_id
+            else:
+                account_id = accounts[matched_name]
 
-                if matched_name not in accounts:
-                    driver.get("https://app.childpaths.ie/user-finance-account/create")
-                    if not create_account(driver, wait, matched_name):
-                        report.append([matched_name, "Account", amount, "FAILED", "Account creation failed"])
-                        continue
-                    account_id = get_account_id(driver)
-                    accounts[matched_name] = account_id
+            status = "OK"
+            if not make_transaction(driver, wait, account_id, "deposit", tx_amount, note, date):
+                status = "FAILED"
+                report.append([matched_name, "Deposit", tx_amount, status, "Error during deposit"])
+                continue
+            report.append([matched_name, "Deposit", tx_amount, "OK", ""])
+            summary.setdefault(matched_name, 0.0)
+            summary[matched_name] += tx_amount
+
+            if returned or amount == 0:
+                if not make_transaction(driver, wait, account_id, "withdrawal", tx_amount, note, date):
+                    report.append([matched_name, "Withdrawal", tx_amount, "FAILED", "Error during withdrawal"])
                 else:
-                    account_id = accounts[matched_name]
-
-                status = "OK"
-                if not make_transaction(driver, wait, account_id, "deposit", tx_amount, note, date):
-                    status = "FAILED"
-                    report.append([matched_name, "Deposit", tx_amount, status, "Error during deposit"])
-                    continue
-                report.append([matched_name, "Deposit", tx_amount, "OK", ""]) 
-
-                if returned or amount == 0:
-                    if not make_transaction(driver, wait, account_id, "withdrawal", tx_amount, note, date):
-                        report.append([matched_name, "Withdrawal", tx_amount, "FAILED", "Error during withdrawal"])
-                    else:
-                        report.append([matched_name, "Withdrawal", tx_amount, "OK", ""])
+                    report.append([matched_name, "Withdrawal", tx_amount, "OK", ""])
+                    summary[matched_name] -= tx_amount
 
         with open(REPORT_FILE, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(["Bill Payer", "Type", "Amount", "Status", "Notes"])
             writer.writerows(report)
-        print(f"✅ Done. Report saved to {REPORT_FILE}")
+
+        print("\n📊 Summary by Bill Payer:")
+        for k, v in summary.items():
+            print(f"{k}: {v:+.2f} EUR")
+
+        print(f"\n✅ Done. Report saved to {REPORT_FILE}")
+        print(f"📝 Debug log saved to {LOG_FILE}")
 
     finally:
         driver.quit()
